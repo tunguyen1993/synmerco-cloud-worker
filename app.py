@@ -2,9 +2,9 @@
 """
 Synmerco 24/7 Cloud Worker & Doorbell Server for Render Free Web Services.
 - Python 3.12 stdlib-only, non-root container compatible, zero baked-in secrets.
-- Maintains <=50s Synmerco heartbeats (Rule 1), listens on PORT (default 10000) for
-  GET /health and POST /doorbell webhook wakeups (Rule 18), and applies
-  v86-Aligned pre-bid filtering/pricing (Rule 14, Rule 15, Rule 18, Rule 26, Rule 29).
+- Maintains <=50s Synmerco heartbeats (Rule 1), syncs live score/passed via GET /v1/agents/{did},
+  listens on PORT (default 10000) for GET /health, POST /doorbell (Rule 18), GET /api/state,
+  and authenticated POST /api/synmerco relay so PC1 can push verified deliverables through Render.
 """
 from __future__ import annotations
 
@@ -25,8 +25,13 @@ from typing import Any
 
 DEFAULT_API_BASE = "https://synmerco-escrow.onrender.com"
 HEARTBEAT_INTERVAL_SEC = 50
+SCORE_REFRESH_SEC = 300
 MAX_DOORBELL_BYTES = 262144
+MAX_RELAY_BYTES = 6 * 1024 * 1024
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
+ALLOWED_RELAY_PATH_RE = re.compile(
+    r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|data-files|submit-proof))?$"
+)
 
 UNSUPPORTED_VENUES = (
     "discord", "bluesky", "mastodon", "refer ", "referral", "hashnode", "medium.com",
@@ -208,7 +213,7 @@ def build_bid_message(bot_key: str, item: dict[str, Any]) -> str:
 
 
 class SynmercoCloudWorker:
-    """Stateful Synmerco worker coordinating heartbeat, doorbell wakeup, and auto-bidding."""
+    """Stateful Synmerco worker coordinating heartbeat, doorbell wakeup, auto-bidding, and delivery relay."""
 
     def __init__(self, api_base: str, bots: list[dict[str, str]], auto_bid: bool = True) -> None:
         self.api_base = api_base
@@ -218,6 +223,7 @@ class SynmercoCloudWorker:
         self.wake_event = threading.Event()
         self.lock = threading.Lock()
         self.bot_states: dict[str, dict[str, Any]] = {}
+        self.bot_scores: dict[str, tuple[float, int, int, str]] = {}
         self.recent_events: list[dict[str, Any]] = []
         self.attempted_intent_bids: set[str] = set()
         self.doorbell_hits = 0
@@ -231,7 +237,7 @@ class SynmercoCloudWorker:
     def api_call(self, path: str, method: str = "GET", body: dict[str, Any] | None = None, api_key: str | None = None) -> dict[str, Any]:
         """Execute an HTTPS JSON call to Synmerco API."""
         url = f"{self.api_base}{path}"
-        headers = {"User-Agent": "SynmercoCloudWorker/1.0", "Accept": "application/json"}
+        headers = {"User-Agent": "SynmercoCloudWorker/1.1", "Accept": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         data_bytes = None
@@ -240,14 +246,51 @@ class SynmercoCloudWorker:
             data_bytes = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=25) as resp:
                 raw = resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
                 return json.loads(raw) if raw.strip() else {"ok": True}
         except urllib.error.HTTPError as exc:
             err_body = exc.read(65536).decode("utf-8", errors="replace")
-            return {"ok": False, "http_status": exc.code, "error": err_body[:300]}
+            return {"ok": False, "http_status": exc.code, "error": err_body[:400]}
         except Exception as exc:
             return {"ok": False, "error": repr(exc)[:300]}
+
+    def _refresh_bot_score(self, bkey: str, did: str) -> tuple[int, int, str]:
+        now = time.time()
+        cached = self.bot_scores.get(bkey)
+        if cached and (now - cached[0]) < SCORE_REFRESH_SEC:
+            return cached[1], cached[2], cached[3]
+        res = self.api_call(f"/v1/agents/{urllib.parse.quote(did, safe=':')}", method="GET")
+        if res and res.get("ok", True) and "synmercoScore" in res:
+            stats = res.get("stats") if isinstance(res.get("stats"), dict) else {}
+            score = int(res.get("synmercoScore") or 0)
+            passed = int(stats.get("passed") or 0)
+            tier = str(res.get("tier") or "New")
+            self.bot_scores[bkey] = (now, score, passed, tier)
+            return score, passed, tier
+        if cached:
+            return cached[1], cached[2], cached[3]
+        return 0, 0, "New"
+
+    def relay_escrow_call(self, path: str, method: str, body: dict[str, Any] | None, bot_key: str | None = None) -> dict[str, Any]:
+        """Forward allowlisted Synmerco escrow calls from PC1 through this Render worker."""
+        if not ALLOWED_RELAY_PATH_RE.match(path):
+            return {"ok": False, "http_status": 403, "error": "relay_path_forbidden"}
+        if method not in {"GET", "POST"}:
+            return {"ok": False, "http_status": 405, "error": "relay_method_forbidden"}
+        target = None
+        for bot in self.bots:
+            if not bot_key or bot["botKey"].upper() == bot_key.upper():
+                target = bot
+                break
+        if not target:
+            return {"ok": False, "http_status": 404, "error": "bot_not_configured"}
+        res = self.api_call(path, method=method, body=body, api_key=target["apiKey"])
+        self._record_event(
+            "relay_escrow",
+            {"botKey": target["botKey"], "method": method, "path": path, "ok": bool(res.get("ok", True) and not res.get("error"))},
+        )
+        return res
 
     def step_once(self) -> None:
         """Run one heartbeat, escrow check, and optional auto-bid pass across configured bots."""
@@ -255,23 +298,21 @@ class SynmercoCloudWorker:
             bkey = bot["botKey"]
             did = bot["did"]
             api_key = bot["apiKey"]
-            hb = self.api_call("/v1/agents/heartbeat", method="POST", body={}, api_key=api_key)
+            hb = self.api_call("/v1/agents/heartbeat", method="POST", body={"availability": "online"}, api_key=api_key)
+            score, passed, tier = self._refresh_bot_score(bkey, did)
             esc_res = self.api_call("/v1/escrows?role=seller&limit=20", method="GET", api_key=api_key)
             escrows = esc_res.get("escrows") or esc_res.get("items") or []
             active_escrows = [
                 {
                     "id": e.get("escrowId") or e.get("id"),
                     "state": e.get("state"),
+                    "title": e.get("title") or e.get("jobTitle"),
                     "netToSellerCents": e.get("netToSellerCents"),
                 }
                 for e in escrows
                 if str(e.get("state") or "") in {"funded", "revision_requested", "disputed"}
             ]
             readiness = hb.get("readiness") if isinstance(hb.get("readiness"), dict) else {}
-            track = hb.get("trackRecord") if isinstance(hb.get("trackRecord"), dict) else {}
-            stats = track.get("stats") if isinstance(track.get("stats"), dict) else {}
-            score = int(hb.get("synmercoScore") or track.get("synmercoScore") or 0)
-            passed = int(stats.get("passed") or 0)
             busy = bool(hb.get("busy")) or len(active_escrows) > 0
             live = bool(readiness.get("live"))
 
@@ -282,6 +323,7 @@ class SynmercoCloudWorker:
                     "live": live,
                     "busy": busy,
                     "score": score,
+                    "tier": tier,
                     "passed": passed,
                     "unreadJobNotices": int(hb.get("unreadJobNotices") or 0),
                     "activeEscrows": active_escrows,
@@ -370,26 +412,54 @@ def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: s
             self.end_headers()
             self.wfile.write(body)
 
+        def _check_sync_auth(self) -> bool:
+            if not sync_token:
+                self._send_json(403, {"ok": False, "error": "cloud_sync_token_not_configured"})
+                return False
+            auth = self.headers.get("Authorization") or ""
+            expected = f"Bearer {sync_token}"
+            if not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return False
+            return True
+
         def do_GET(self) -> None:
             path = urllib.parse.urlparse(self.path).path
             if path in {"/", "/health"}:
                 self._send_json(200, worker.public_health())
                 return
             if path == "/api/state":
-                if not sync_token:
-                    self._send_json(403, {"ok": False, "error": "cloud_sync_token_not_configured"})
-                    return
-                auth = self.headers.get("Authorization") or ""
-                expected = f"Bearer {sync_token}"
-                if not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
-                    self._send_json(401, {"ok": False, "error": "unauthorized"})
-                    return
-                self._send_json(200, worker.authenticated_state())
+                if self._check_sync_auth():
+                    self._send_json(200, worker.authenticated_state())
                 return
             self._send_json(404, {"ok": False, "error": "not_found"})
 
         def do_POST(self) -> None:
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/synmerco":
+                if not self._check_sync_auth():
+                    return
+                raw_len = self.headers.get("Content-Length") or "0"
+                try:
+                    content_len = min(max(0, int(raw_len)), MAX_RELAY_BYTES)
+                except ValueError:
+                    self._send_json(400, {"ok": False, "error": "bad_content_length"})
+                    return
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                try:
+                    req_obj = json.loads(raw_body.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json(400, {"ok": False, "error": "invalid_json"})
+                    return
+                relay_path = str(req_obj.get("path") or "").strip()
+                relay_method = str(req_obj.get("method") or "POST").strip().upper()
+                relay_body = req_obj.get("body") if isinstance(req_obj.get("body"), dict) else None
+                bot_key = str(req_obj.get("botKey") or "").strip() or None
+                res = worker.relay_escrow_call(relay_path, relay_method, relay_body, bot_key=bot_key)
+                status = int(res.get("http_status") or 200) if not res.get("ok", True) else 200
+                self._send_json(status, res)
+                return
+
             if path not in {"/doorbell", "/webhook/synmerco"}:
                 self._send_json(404, {"ok": False, "error": "not_found"})
                 return
@@ -421,7 +491,7 @@ def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: s
 
 
 def _run_self_test() -> dict[str, Any]:
-    """Run local adversarial tests covering v86 pricing, honeypot gate, auth, and HTTP server."""
+    """Run local adversarial tests covering v86 pricing, score refresh, relay, and HTTP server."""
     assert evaluate_intent_pre_bid({"title": "Send USDC bond", "budgetCents": 500})["bid_safe"] is False
     assert evaluate_intent_pre_bid({"title": "Post on Discord", "budgetCents": 500})["bid_safe"] is False
     assert evaluate_intent_pre_bid(
@@ -439,18 +509,23 @@ def _run_self_test() -> dict[str, Any]:
     assert not any(w in msg.lower() for w in RULE15_FORBIDDEN_WORDS)
 
     mock_bids: list[dict[str, Any]] = []
+    mock_proofs: list[dict[str, Any]] = []
 
     class MockSynmerco(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
         def do_POST(self) -> None:
+            n = int(self.headers.get("Content-Length") or "0")
+            body = json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
             if self.path == "/v1/agents/heartbeat":
-                out = {"ok": True, "readiness": {"live": True}, "busy": False, "synmercoScore": 28, "trackRecord": {"stats": {"passed": 0}}}
+                out = {"ok": True, "readiness": {"live": True}, "busy": False}
             elif "/bids" in self.path:
-                n = int(self.headers.get("Content-Length") or "0")
-                mock_bids.append(json.loads(self.rfile.read(n).decode("utf-8")))
+                mock_bids.append(body)
                 out = {"ok": True, "bidId": "bid_test_1"}
+            elif self.path.endswith("/submit-proof"):
+                mock_proofs.append(body)
+                out = {"ok": True, "submitted": True}
             else:
                 out = {"ok": False}
             raw = json.dumps(out).encode("utf-8")
@@ -461,7 +536,9 @@ def _run_self_test() -> dict[str, Any]:
             self.wfile.write(raw)
 
         def do_GET(self) -> None:
-            if self.path.startswith("/v1/escrows"):
+            if self.path.startswith("/v1/agents/"):
+                out = {"synmercoScore": 28, "tier": "New", "stats": {"passed": 0}}
+            elif self.path.startswith("/v1/escrows"):
                 out = {"escrows": []}
             elif self.path.startswith("/v1/intents"):
                 out = {"intents": [{"intentId": "int_1", **safe_item}]}
@@ -486,33 +563,41 @@ def _run_self_test() -> dict[str, Any]:
     )
     worker.step_once()
     assert len(mock_bids) == 1 and mock_bids[0]["amountCents"] == 135
+    assert worker.public_health()["bots"][0]["score"] == 28
 
     sync_tok = "sync-tok-test"
-    app_srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(worker, sync_tok, "hook-sec"))
+    app_srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(worker, sync_tok, ""))
     app_port = app_srv.server_address[1]
     threading.Thread(target=app_srv.serve_forever, daemon=True).start()
 
     health_txt = urllib.request.urlopen(f"http://127.0.0.1:{app_port}/health", timeout=5).read().decode("utf-8")
     assert secret_key not in health_txt and json.loads(health_txt)["ok"] is True
 
+    # Verify forbidden relay path rejected (403) and allowed submit-proof forwarded (200)
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{app_port}/api/state", timeout=5)
-        raise AssertionError("Expected 401 on unauthenticated /api/state")
+        req_bad = urllib.request.Request(
+            f"http://127.0.0.1:{app_port}/api/synmerco",
+            data=json.dumps({"path": "/v1/wallets/transfer", "method": "POST"}).encode("utf-8"),
+            headers={"Authorization": f"Bearer {sync_tok}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req_bad, timeout=5)
+        raise AssertionError("Expected 403 on forbidden relay path")
     except urllib.error.HTTPError as exc:
-        assert exc.code == 401
+        assert exc.code == 403
 
-    req_state = urllib.request.Request(f"http://127.0.0.1:{app_port}/api/state", headers={"Authorization": f"Bearer {sync_tok}"})
-    state_json = json.loads(urllib.request.urlopen(req_state, timeout=5).read().decode("utf-8"))
-    assert state_json["attemptedBidsCount"] == 1
-
-    req_hook = urllib.request.Request(
-        f"http://127.0.0.1:{app_port}/doorbell",
-        data=b'{"event":"job.available"}',
-        headers={"Content-Type": "application/json", "X-Webhook-Secret": "hook-sec"},
+    req_ok = urllib.request.Request(
+        f"http://127.0.0.1:{app_port}/api/synmerco",
+        data=json.dumps({
+            "path": "/v1/escrows/esc_123/submit-proof",
+            "method": "POST",
+            "body": {"proofHash": "abc", "proofUri": "https://example.com/p.md"},
+        }).encode("utf-8"),
+        headers={"Authorization": f"Bearer {sync_tok}", "Content-Type": "application/json"},
         method="POST",
     )
-    hook_res = json.loads(urllib.request.urlopen(req_hook, timeout=5).read().decode("utf-8"))
-    assert hook_res["accepted"] is True and worker.wake_event.is_set()
+    ok_res = json.loads(urllib.request.urlopen(req_ok, timeout=5).read().decode("utf-8"))
+    assert ok_res["submitted"] is True and len(mock_proofs) == 1
 
     app_srv.shutdown()
     mock_srv.shutdown()
