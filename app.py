@@ -119,8 +119,21 @@ def load_bot_configs_from_env() -> list[dict[str, str]]:
         api_key = (os.environ.get("SYNMERCO_API_KEY") or "").strip()
         did = (os.environ.get("SYNMERCO_BOT_DID") or "").strip()
         key = (os.environ.get("SYNMERCO_BOT_KEY") or "CLOUD_1").strip()
+        display_name = (os.environ.get("SYNMERCO_BOT_NAME") or "").strip()
+        desc = (os.environ.get("SYNMERCO_BOT_DESC") or "").strip()
+        caps_raw = (os.environ.get("SYNMERCO_BOT_CAPS") or "").strip()
+        caps = [c.strip() for c in caps_raw.split(",") if c.strip()] if caps_raw else []
+        doorbell_url = (os.environ.get("SYNMERCO_DOORBELL_URL") or "").strip()
         if api_key and did:
-            bots.append({"botKey": key, "did": did, "apiKey": api_key})
+            bots.append({
+                "botKey": key,
+                "did": did,
+                "apiKey": api_key,
+                "displayName": display_name,
+                "description": desc,
+                "caps": caps,
+                "doorbellUrl": doorbell_url,
+            })
 
     allow_multi = os.environ.get("ALLOW_MULTI_BOT", "").lower() in {"1", "true", "yes"}
     if len(bots) > 1 and not allow_multi:
@@ -182,9 +195,11 @@ def evaluate_intent_pre_bid(item: dict[str, Any], now_ts: float | None = None) -
     return {"bid_safe": True, "block_reason": None, "budget_cents": budget_cents, "num_pulls": num_pulls}
 
 
-def compute_v86_bid_cents(budget_cents: int, score: int, passed: int) -> int:
-    """Compute v86-Aligned bid amount respecting Rule 18 tiers and Rule 26 $15 cap."""
+def compute_v86_bid_cents(budget_cents: int, score: int, passed: int, target_bid_cents: int = 0) -> int:
+    """Compute v86-Aligned bid amount respecting target overrides, Rule 18 tiers, and Rule 26 $15 cap."""
     effective_budget = min(budget_cents, 1500) if passed == 0 else budget_cents
+    if target_bid_cents > 0:
+        return max(1, min(effective_budget, target_bid_cents))
     if passed == 0:
         raw = int(round(effective_budget * 0.22))
         floor = 135 if effective_budget >= 250 else (100 if effective_budget >= 100 else 1)
@@ -215,10 +230,17 @@ def build_bid_message(bot_key: str, item: dict[str, Any]) -> str:
 class SynmercoCloudWorker:
     """Stateful Synmerco worker coordinating heartbeat, doorbell wakeup, auto-bidding, and delivery relay."""
 
-    def __init__(self, api_base: str, bots: list[dict[str, str]], auto_bid: bool = True) -> None:
+    def __init__(
+        self,
+        api_base: str,
+        bots: list[dict[str, Any]],
+        auto_bid: bool = True,
+        target_bid_cents: int = 0,
+    ) -> None:
         self.api_base = api_base
         self.bots = bots
         self.auto_bid = auto_bid
+        self.target_bid_cents = max(0, int(target_bid_cents))
         self.start_ts = time.time()
         self.wake_event = threading.Event()
         self.lock = threading.Lock()
@@ -292,6 +314,40 @@ class SynmercoCloudWorker:
         )
         return res
 
+    def _maybe_auto_register_capability(self, bot: dict[str, Any], err_text: str) -> str | None:
+        """If bid failed on agent_not_compatible, add safe missing capability and return it."""
+        if "agent_not_compatible" not in err_text:
+            return None
+        match_cap = re.search(r'needs capability\s+\\?"([a-z0-9_-]{2,64})\\?"', err_text)
+        if not match_cap:
+            return None
+        req_cap = match_cap.group(1).strip()
+        if any(bad in req_cap.lower() for bad in UNSUPPORTED_VENUES):
+            return None
+        display_name = str(bot.get("displayName") or "").strip()
+        desc = str(bot.get("description") or "").strip()
+        if not display_name or len(desc) < 40:
+            return None
+        caps = list(bot.get("caps") or [])
+        if req_cap not in caps:
+            caps.append(req_cap)
+        if len(caps) > 20:
+            caps = caps[-20:]
+        bot["caps"] = caps
+        reg_body: dict[str, Any] = {
+            "displayName": display_name,
+            "description": desc,
+            "capabilities": caps,
+            "checkIn": "poll",
+        }
+        if bot.get("doorbellUrl"):
+            reg_body["doorbellUrl"] = str(bot["doorbellUrl"])
+        reg_res = self.api_call("/v1/agents/register", method="POST", body=reg_body, api_key=bot["apiKey"])
+        if not reg_res.get("ok", True) or reg_res.get("error"):
+            return None
+        self._record_event("auto_capability", {"botKey": bot["botKey"], "capability": req_cap})
+        return req_cap
+
     def step_once(self) -> None:
         """Run one heartbeat, escrow check, and optional auto-bid pass across configured bots."""
         for bot in self.bots:
@@ -349,14 +405,17 @@ class SynmercoCloudWorker:
                 if not gate["bid_safe"]:
                     self.attempted_intent_bids.add(dedupe_key)
                     continue
-                amount_cents = compute_v86_bid_cents(gate["budget_cents"], score, passed)
-                bid_msg = build_bid_message(bkey, item)
-                bid_res = self.api_call(
-                    f"/v1/intents/{urllib.parse.quote(iid)}/bids",
-                    method="POST",
-                    body={"bidderDid": did, "amountCents": amount_cents, "message": bid_msg},
-                    api_key=api_key,
+                amount_cents = compute_v86_bid_cents(
+                    gate["budget_cents"], score, passed, target_bid_cents=self.target_bid_cents
                 )
+                bid_msg = build_bid_message(bkey, item)
+                bid_path = f"/v1/intents/{urllib.parse.quote(iid)}/bids"
+                bid_payload = {"bidderDid": did, "amountCents": amount_cents, "message": bid_msg}
+                bid_res = self.api_call(bid_path, method="POST", body=bid_payload, api_key=api_key)
+                if not bid_res.get("ok", True) or bid_res.get("error"):
+                    added_cap = self._maybe_auto_register_capability(bot, str(bid_res.get("error") or ""))
+                    if added_cap:
+                        bid_res = self.api_call(bid_path, method="POST", body=bid_payload, api_key=api_key)
                 self.attempted_intent_bids.add(dedupe_key)
                 self._record_event(
                     "auto_bid",
@@ -377,6 +436,7 @@ class SynmercoCloudWorker:
             "uptimeSec": round(time.time() - self.start_ts, 1),
             "configuredBots": len(self.bots),
             "autoBid": self.auto_bid,
+            "targetBidCents": self.target_bid_cents,
             "doorbellHits": self.doorbell_hits,
             "bots": list(self.bot_states.values()),
             "ts": utc_now_iso(),
@@ -502,6 +562,8 @@ def _run_self_test() -> dict[str, Any]:
 
     assert compute_v86_bid_cents(500, 28, 0) == 135
     assert compute_v86_bid_cents(2500, 28, 0) == 330
+    assert compute_v86_bid_cents(800, 28, 0, target_bid_cents=500) == 500
+    assert compute_v86_bid_cents(350, 28, 0, target_bid_cents=500) == 350
     assert compute_v86_bid_cents(500, 69, 3) == 340
     assert compute_v86_bid_cents(500, 59, 4) == 380
     assert compute_v86_bid_cents(500, 48, 1) == 260
@@ -510,6 +572,7 @@ def _run_self_test() -> dict[str, Any]:
 
     mock_bids: list[dict[str, Any]] = []
     mock_proofs: list[dict[str, Any]] = []
+    mock_regs: list[dict[str, Any]] = []
 
     class MockSynmerco(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -520,7 +583,18 @@ def _run_self_test() -> dict[str, Any]:
             body = json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
             if self.path == "/v1/agents/heartbeat":
                 out = {"ok": True, "readiness": {"live": True}, "busy": False}
+            elif self.path == "/v1/agents/register":
+                mock_regs.append(body)
+                out = {"ok": True, "capabilities": body.get("capabilities")}
             elif "/bids" in self.path:
+                if not mock_regs:
+                    err_raw = json.dumps({"ok": False, "error": 'agent_not_compatible: needs capability "clinical-audit"'}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err_raw)))
+                    self.end_headers()
+                    self.wfile.write(err_raw)
+                    return
                 mock_bids.append(body)
                 out = {"ok": True, "bidId": "bid_test_1"}
             elif self.path.endswith("/submit-proof"):
@@ -558,10 +632,18 @@ def _run_self_test() -> dict[str, Any]:
     secret_key = "test-secret-api-key-never-leak"
     worker = SynmercoCloudWorker(
         validate_api_base(f"http://127.0.0.1:{mock_port}", allow_local_test=True),
-        [{"botKey": "CLOUD_1", "did": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD", "apiKey": secret_key}],
+        [{
+            "botKey": "CLOUD_1",
+            "did": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD",
+            "apiKey": secret_key,
+            "displayName": "CloudBotTest",
+            "description": "Cloud test research specialist verifying SEC filings and regulatory APIs accurately.",
+            "caps": ["research", "general"],
+        }],
         auto_bid=True,
     )
     worker.step_once()
+    assert len(mock_regs) == 1 and "clinical-audit" in mock_regs[0]["capabilities"]
     assert len(mock_bids) == 1 and mock_bids[0]["amountCents"] == 135
     assert worker.public_health()["bots"][0]["score"] == 28
 
@@ -613,11 +695,14 @@ def main() -> int:
     api_base = validate_api_base(os.environ.get("SYNMERCO_API_BASE") or DEFAULT_API_BASE)
     bots = load_bot_configs_from_env()
     auto_bid = os.environ.get("SYNMERCO_AUTO_BID", "true").lower() not in {"0", "false", "no"}
+    target_bid_cents = int(os.environ.get("SYNMERCO_TARGET_BID_CENTS") or "0")
     sync_token = (os.environ.get("CLOUD_SYNC_TOKEN") or "").strip()
     webhook_secret = (os.environ.get("SYNMERCO_WEBHOOK_SECRET") or "").strip()
     port = int(os.environ.get("PORT") or "10000")
 
-    worker = SynmercoCloudWorker(api_base=api_base, bots=bots, auto_bid=auto_bid)
+    worker = SynmercoCloudWorker(
+        api_base=api_base, bots=bots, auto_bid=auto_bid, target_bid_cents=target_bid_cents
+    )
     srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(worker, sync_token, webhook_secret))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"[{utc_now_iso()}] Synmerco Cloud Worker listening on :{port} bots={len(bots)} autoBid={auto_bid}")
