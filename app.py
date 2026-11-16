@@ -191,25 +191,27 @@ def evaluate_intent_pre_bid(item: dict[str, Any], now_ts: float | None = None) -
     )
     if budget_cents <= 0:
         return {"bid_safe": False, "block_reason": "non_positive_budget", "budget_cents": 0}
+    if budget_cents > 50000:
+        return {"bid_safe": False, "block_reason": "above_max_budget_50000c", "budget_cents": budget_cents}
 
     return {"bid_safe": True, "block_reason": None, "budget_cents": budget_cents, "num_pulls": num_pulls}
 
 
 def compute_v86_bid_cents(budget_cents: int, score: int, passed: int, target_bid_cents: int = 0) -> int:
-    """Compute v86-Aligned bid amount respecting target overrides, Rule 18 tiers, and Rule 26 $15 cap."""
-    effective_budget = min(budget_cents, 1500) if passed == 0 else budget_cents
-    if target_bid_cents > 0:
-        return max(1, min(effective_budget, target_bid_cents))
+    """Compute v86 max-capture bid amount: graduation target/55% while New, 74-88% up to $500 once passed>=1."""
+    effective_budget = min(budget_cents, 1500) if passed == 0 else min(budget_cents, 50000)
     if passed == 0:
-        raw = int(round(effective_budget * 0.22))
-        floor = 135 if effective_budget >= 250 else (100 if effective_budget >= 100 else 1)
+        if target_bid_cents > 0:
+            return max(1, min(effective_budget, target_bid_cents))
+        raw = int(round(effective_budget * 0.55))
+        floor = 100 if effective_budget >= 100 else 1
         return max(floor, min(effective_budget, raw))
     if score >= 65:
-        ratio = 0.68
-    elif score >= 55:
-        ratio = 0.76
+        ratio = 0.88
+    elif score >= 45:
+        ratio = 0.82
     else:
-        ratio = 0.52
+        ratio = 0.74
     return max(100 if effective_budget >= 100 else 1, min(effective_budget, int(round(effective_budget * ratio))))
 
 
@@ -345,6 +347,17 @@ class SynmercoCloudWorker:
         reg_res = self.api_call("/v1/agents/register", method="POST", body=reg_body, api_key=bot["apiKey"])
         if not reg_res.get("ok", True) or reg_res.get("error"):
             return None
+        svc_body = {
+            "capability": req_cap,
+            "title": f"{display_name}: {req_cap}",
+            "rateCents": self.target_bid_cents or 500,
+            "rateType": "per_job",
+            "currency": "USD",
+            "negotiable": True,
+            "slaDeliveryMinutes": 120,
+            "description": f"{desc[:240]} Automated {req_cap} execution with verbatim API excerpts.",
+        }
+        self.api_call("/v1/services", method="POST", body=svc_body, api_key=bot["apiKey"])
         self._record_event("auto_capability", {"botKey": bot["botKey"], "capability": req_cap})
         return req_cap
 
@@ -394,21 +407,36 @@ class SynmercoCloudWorker:
 
             open_res = self.api_call("/v1/intents?status=open&limit=25", method="GET", api_key=api_key)
             all_res = self.api_call("/v1/intents?limit=25", method="GET", api_key=api_key)
+            jobs_res = self.api_call("/v1/jobs?status=open&limit=25", method="GET", api_key=api_key)
+            raw_rows = (
+                list(hb.get("jobsForYou") or [])
+                + list(open_res.get("intents") or open_res.get("items") or [])
+                + list(all_res.get("intents") or all_res.get("items") or [])
+                + list(jobs_res.get("jobs") or jobs_res.get("items") or [])
+            )
             merged_intents: dict[str, dict[str, Any]] = {}
-            for row in (open_res.get("intents") or open_res.get("items") or []) + (
-                all_res.get("intents") or all_res.get("items") or []
-            ):
+            for row in raw_rows:
                 if not isinstance(row, dict):
                     continue
+                status_low = str(row.get("status") or "open").strip().lower()
+                if status_low not in {"open", "bidding"}:
+                    continue
                 riid = str(row.get("intentId") or row.get("id") or "").strip()
-                if riid and riid not in merged_intents:
-                    merged_intents[riid] = row
-            for iid, item in merged_intents.items():
-                dedupe_key = f"{bkey}:{iid}"
+                if riid:
+                    prev_row = merged_intents.get(riid) or {}
+                    merged_intents[riid] = {**prev_row, **{k: v for k, v in row.items() if v not in (None, "")}}
+            for iid, item in sorted(
+                merged_intents.items(),
+                key=lambda kv: -parse_cents(kv[1].get("budgetCents") or kv[1].get("maxBudgetCents") or 0),
+            ):
+                dedupe_key = f"{bkey}:{iid}:{int(passed > 0)}"
                 if dedupe_key in self.attempted_intent_bids:
                     continue
                 gate = evaluate_intent_pre_bid(item)
                 if not gate["bid_safe"]:
+                    self.attempted_intent_bids.add(dedupe_key)
+                    continue
+                if passed == 0 and gate["budget_cents"] > 1500:
                     self.attempted_intent_bids.add(dedupe_key)
                     continue
                 amount_cents = compute_v86_bid_cents(
@@ -570,19 +598,21 @@ def _run_self_test() -> dict[str, Any]:
     safe_item = {"title": "Verify SEC filing EX-99.1", "budgetCents": 500, "deadline": "2099-01-01T00:00:00Z"}
     assert evaluate_intent_pre_bid(safe_item, now_ts=1700000000.0)["bid_safe"] is True
 
-    assert compute_v86_bid_cents(500, 28, 0) == 135
-    assert compute_v86_bid_cents(2500, 28, 0) == 330
+    assert compute_v86_bid_cents(500, 28, 0) == 275
+    assert compute_v86_bid_cents(2500, 28, 0) == 825
     assert compute_v86_bid_cents(800, 28, 0, target_bid_cents=500) == 500
     assert compute_v86_bid_cents(350, 28, 0, target_bid_cents=500) == 350
-    assert compute_v86_bid_cents(500, 69, 3) == 340
-    assert compute_v86_bid_cents(500, 59, 4) == 380
-    assert compute_v86_bid_cents(500, 48, 1) == 260
+    assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 8800
+    assert compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 8200
+    assert compute_v86_bid_cents(500, 48, 1) == 410
+    assert evaluate_intent_pre_bid({"title": "Big >500", "budgetCents": 50001})["bid_safe"] is False
     msg = build_bid_message("CLOUD_1", safe_item)
     assert not any(w in msg.lower() for w in RULE15_FORBIDDEN_WORDS)
 
     mock_bids: list[dict[str, Any]] = []
     mock_proofs: list[dict[str, Any]] = []
     mock_regs: list[dict[str, Any]] = []
+    mock_svcs: list[dict[str, Any]] = []
 
     class MockSynmerco(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -592,10 +622,13 @@ def _run_self_test() -> dict[str, Any]:
             n = int(self.headers.get("Content-Length") or "0")
             body = json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
             if self.path == "/v1/agents/heartbeat":
-                out = {"ok": True, "readiness": {"live": True}, "busy": False}
+                out = {"ok": True, "readiness": {"live": True}, "busy": False, "jobsForYou": []}
             elif self.path == "/v1/agents/register":
                 mock_regs.append(body)
                 out = {"ok": True, "capabilities": body.get("capabilities")}
+            elif self.path == "/v1/services":
+                mock_svcs.append(body)
+                out = {"ok": True, "listingId": "svc_test_1"}
             elif "/bids" in self.path:
                 if not mock_regs:
                     err_raw = json.dumps({"ok": False, "error": 'agent_not_compatible: needs capability "clinical-audit"'}).encode("utf-8")
@@ -625,7 +658,9 @@ def _run_self_test() -> dict[str, Any]:
             elif self.path.startswith("/v1/escrows"):
                 out = {"escrows": []}
             elif self.path.startswith("/v1/intents"):
-                out = {"intents": [{"intentId": "int_1", **safe_item}]}
+                out = {"intents": [{"intentId": "int_1", **safe_item}, {"intentId": "int_gt15_skip", "title": "Skip >$15 for new", "budgetCents": 2500, "deadline": "2099-01-01T00:00:00Z"}]}
+            elif self.path.startswith("/v1/jobs"):
+                out = {"jobs": [{"intentId": "int_from_jobs", "title": "Open job feed", "status": "open", "budgetCents": 600, "deadline": "2099-01-01T00:00:00Z"}]}
             else:
                 out = {}
             raw = json.dumps(out).encode("utf-8")
@@ -654,7 +689,8 @@ def _run_self_test() -> dict[str, Any]:
     )
     worker.step_once()
     assert len(mock_regs) == 1 and "clinical-audit" in mock_regs[0]["capabilities"]
-    assert len(mock_bids) == 1 and mock_bids[0]["amountCents"] == 135
+    assert len(mock_svcs) == 1 and mock_svcs[0]["capability"] == "clinical-audit"
+    assert sorted(b["amountCents"] for b in mock_bids) == [275, 330], f"unexpected mock_bids={mock_bids}"
     assert worker.public_health()["bots"][0]["score"] == 28
 
     sync_tok = "sync-tok-test"
