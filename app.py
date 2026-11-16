@@ -392,12 +392,18 @@ class SynmercoCloudWorker:
             if not self.auto_bid or not live or busy:
                 continue
 
-            intents_res = self.api_call("/v1/intents?limit=25", method="GET", api_key=api_key)
-            intents = intents_res.get("intents") or intents_res.get("items") or []
-            for item in intents:
-                iid = str(item.get("intentId") or item.get("id") or "").strip()
-                if not iid:
+            open_res = self.api_call("/v1/intents?status=open&limit=25", method="GET", api_key=api_key)
+            all_res = self.api_call("/v1/intents?limit=25", method="GET", api_key=api_key)
+            merged_intents: dict[str, dict[str, Any]] = {}
+            for row in (open_res.get("intents") or open_res.get("items") or []) + (
+                all_res.get("intents") or all_res.get("items") or []
+            ):
+                if not isinstance(row, dict):
                     continue
+                riid = str(row.get("intentId") or row.get("id") or "").strip()
+                if riid and riid not in merged_intents:
+                    merged_intents[riid] = row
+            for iid, item in merged_intents.items():
                 dedupe_key = f"{bkey}:{iid}"
                 if dedupe_key in self.attempted_intent_bids:
                     continue
@@ -416,14 +422,18 @@ class SynmercoCloudWorker:
                     added_cap = self._maybe_auto_register_capability(bot, str(bid_res.get("error") or ""))
                     if added_cap:
                         bid_res = self.api_call(bid_path, method="POST", body=bid_payload, api_key=api_key)
-                self.attempted_intent_bids.add(dedupe_key)
+                bid_ok = bool(bid_res.get("ok", True) and not bid_res.get("error"))
+                err_str = str(bid_res.get("error") or "")
+                http_code = int(bid_res.get("http_status") or 0)
+                if bid_ok or "already_bid" in err_str or http_code in {400, 403, 404, 412, 422}:
+                    self.attempted_intent_bids.add(dedupe_key)
                 self._record_event(
                     "auto_bid",
                     {
                         "botKey": bkey,
                         "intentId": iid,
                         "amountCents": amount_cents,
-                        "ok": bool(bid_res.get("ok", True) and not bid_res.get("error")),
+                        "ok": bid_ok,
                         "error": bid_res.get("error"),
                     },
                 )
