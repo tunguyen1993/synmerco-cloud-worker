@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: synmerco-cloud-worker
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: SYNMERCO_AUTO_BID
+        value: "true"
+      - key: SYNMERCO_BOT_KEY
+        sync: false
+      - key: SYNMERCO_BOT_DID
+        sync: false
+      - key: SYNMERCO_API_KEY
+        sync: false
+      - key: CLOUD_SYNC_TOKEN
+        sync: false
+      - key: SYNMERCO_WEBHOOK_SECRET
+        sync: false
