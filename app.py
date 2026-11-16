@@ -30,7 +30,7 @@ MAX_DOORBELL_BYTES = 262144
 MAX_RELAY_BYTES = 6 * 1024 * 1024
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
 ALLOWED_RELAY_PATH_RE = re.compile(
-    r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|data-files|submit-proof))?$"
+    r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|submit-proof|data-files(?:/[A-Za-z0-9_-]+/complete)?))?$"
 )
 
 UNSUPPORTED_VENUES = (
