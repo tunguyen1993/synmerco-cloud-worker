@@ -590,6 +590,9 @@ class SynmercoCloudWorker:
                         bot_key=bkey,
                         bid_ratio_pct=self.bid_ratio_pct,
                     )
+                    min_bid_cents = parse_cents(item.get("minBidCents") or 0)
+                    if 0 < min_bid_cents <= gate["budget_cents"]:
+                        amount_cents = max(min_bid_cents, amount_cents)
                     bid_msg = build_bid_message(bkey, item)
                     bid_path = f"/v1/intents/{urllib.parse.quote(iid)}/bids"
                     bid_payload = {"bidderDid": did, "amountCents": amount_cents, "message": bid_msg}
