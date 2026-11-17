@@ -31,8 +31,8 @@ MAX_RELAY_BYTES = 6 * 1024 * 1024
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
 SAFE_AUTO_CAP_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$")
 STARTER_RATECARD_CAPS = ("research", "data_apis", "live-data", "general")
-LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 21, "S9": 21, "S10": 21, "S11": 21, "S12": 21, "S13": 21, "S14": 21}
-LOW_CAPTURE_FLOOR_BY_BOT: dict[str, int] = {"S7": 100, "S8": 100, "S9": 100, "S10": 100, "S11": 100, "S12": 100, "S13": 100, "S14": 100}
+LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 21, "S9": 21, "S10": 21, "S11": 21, "S12": 21, "S13": 21, "S14": 21, "S15": 21, "S16": 21}
+LOW_CAPTURE_FLOOR_BY_BOT: dict[str, int] = {"S7": 100, "S8": 100, "S9": 100, "S10": 100, "S11": 100, "S12": 100, "S13": 100, "S14": 100, "S15": 100, "S16": 100}
 ALLOWED_RELAY_PATH_RE = re.compile(
     r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|submit-proof|data-files(?:/[A-Za-z0-9_-]+/complete)?))?$"
 )
