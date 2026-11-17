@@ -350,10 +350,16 @@ class SynmercoCloudWorker:
         caps = [c for c in (bot.get("caps") or []) if SAFE_AUTO_CAP_RE.match(c)]
         if not display_name or len(desc) < 40 or not caps:
             return
+        starter_caps = [c for c in STARTER_RATECARD_CAPS if c in caps] or caps[:2]
+        ask_cents = 100 if passed == 0 else max(
+            100,
+            compute_v86_bid_cents(500, score, passed, target_bid_cents=self.target_bid_cents, bot_key=bkey),
+        )
         reg_body: dict[str, Any] = {
             "displayName": display_name,
             "description": desc,
             "capabilities": caps[:20],
+            "rateCents": ask_cents,
             "checkIn": "poll",
         }
         doorbell_url = str(bot.get("doorbellUrl") or "").strip()
@@ -369,11 +375,21 @@ class SynmercoCloudWorker:
             for rc in (prof.get("rateCards") or [])
             if isinstance(rc, dict) and str(rc.get("capability") or "").strip()
         }
-        starter_caps = [c for c in STARTER_RATECARD_CAPS if c in caps] or caps[:2]
-        ask_cents = 100 if passed == 0 else max(
-            100,
-            compute_v86_bid_cents(500, score, passed, target_bid_cents=self.target_bid_cents, bot_key=bkey),
-        )
+        svcs_res = self.api_call("/v1/services?limit=100", method="GET", api_key=bot["apiKey"])
+        if not svcs_res.get("ok", True) or svcs_res.get("error"):
+            self._record_event("service_list_warn", {"botKey": bkey, "error": str(svcs_res.get("error") or "")[:120]})
+            return
+        did_low = str(bot["did"]).strip().lower()
+        for svc in (svcs_res.get("services") or []):
+            if not isinstance(svc, dict):
+                continue
+            if str(svc.get("providerDid") or "").strip().lower() != did_low:
+                continue
+            if str(svc.get("status") or "active").strip().lower() != "active":
+                continue
+            cap_str = str(svc.get("capability") or "").strip().lower()
+            if cap_str:
+                existing_rate_caps.add(cap_str)
         added: list[str] = []
         had_write_err = False
         for cap in starter_caps:
@@ -834,7 +850,18 @@ def _run_self_test() -> dict[str, Any]:
                     "synmercoScore": sc,
                     "tier": tr,
                     "stats": {"passed": mock_state["passed"]},
-                    "rateCards": [{"capability": c, "rateCents": 100} for c in sorted(mock_state["rate_caps"])],
+                    "rateCards": [],
+                }
+            elif self.path.startswith("/v1/services"):
+                out = {
+                    "services": [
+                        {
+                            "providerDid": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD",
+                            "capability": c,
+                            "status": "active",
+                        }
+                        for c in sorted(mock_state["rate_caps"])
+                    ]
                 }
             elif self.path.startswith("/v1/escrows"):
                 out = {"escrows": list(mock_state["escrows"])}
@@ -883,11 +910,13 @@ def _run_self_test() -> dict[str, Any]:
     assert sorted(s["rateCents"] for s in mock_svcs) == [100, 100, 100]
     assert worker.public_health()["bots"][0]["score"] == 28
 
-    # Verify idempotent rateCard sync on subsequent heartbeat & immediate graduation upon escrow pass
+    # Verify idempotent rateCard sync across simulated cold restarts & immediate graduation upon escrow pass
     svc_count_before = len(mock_svcs)
+    worker.profile_sync_done.clear()
+    worker.synced_profiles.clear()
     mock_state["passed"] = 1
     worker.step_once()
-    assert len(mock_svcs) == svc_count_before, "Expected no duplicate starter /v1/services writes"
+    assert len(mock_svcs) == svc_count_before, "Expected no duplicate starter /v1/services writes after cold boot"
     assert worker.public_health()["bots"][0]["passed"] == 1
     assert any(b["amountCents"] == 2050 for b in mock_bids), f"Expected graduated 82% of $25 bid in {mock_bids}"
 
