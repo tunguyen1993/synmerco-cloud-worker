@@ -31,8 +31,8 @@ MAX_RELAY_BYTES = 6 * 1024 * 1024
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
 SAFE_AUTO_CAP_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$")
 STARTER_RATECARD_CAPS = ("research", "data_apis", "live-data", "general")
-LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 29}
-LOW_CAPTURE_FLOOR_BY_BOT: dict[str, int] = {"S7": 100, "S8": 115}
+LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 21}
+LOW_CAPTURE_FLOOR_BY_BOT: dict[str, int] = {"S7": 100, "S8": 100}
 ALLOWED_RELAY_PATH_RE = re.compile(
     r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|submit-proof|data-files(?:/[A-Za-z0-9_-]+/complete)?))?$"
 )
@@ -225,10 +225,7 @@ def compute_v86_bid_cents(
         norm_key = bot_key.strip().upper()
         pct = bid_ratio_pct if 1 <= bid_ratio_pct <= 100 else LOW_CAPTURE_PCT_BY_BOT.get(norm_key, 55)
         raw = _round_pct_cents(effective_budget, pct)
-        if norm_key == "S8" and bid_ratio_pct <= 0:
-            bot_floor = 115 if effective_budget >= 130 else (105 if effective_budget >= 110 else base_floor)
-        else:
-            bot_floor = LOW_CAPTURE_FLOOR_BY_BOT.get(norm_key, base_floor) if effective_budget >= 100 else 1
+        bot_floor = LOW_CAPTURE_FLOOR_BY_BOT.get(norm_key, base_floor) if effective_budget >= 100 else 1
         return max(bot_floor, min(effective_budget, raw))
     ratio_pct = 88 if score >= 65 else (82 if score >= 45 else 74)
     return max(base_floor, min(effective_budget, _round_pct_cents(effective_budget, ratio_pct)))
@@ -761,30 +758,19 @@ def _run_self_test() -> dict[str, Any]:
     assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 8800
     assert compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 8200
     assert compute_v86_bid_cents(500, 48, 1) == 410
-    # Verify S7 & S8 low-capture boundaries + staggered non-collision for all budgets >= 110c + graduation
+    # Verify S7 & S8 low-capture $1.00 (100c) floor and 21% ratio + graduation
     assert compute_v86_bid_cents(1, 28, 0, bot_key="S7") == 1
     assert compute_v86_bid_cents(99, 28, 0, bot_key="S7") == 21
-    assert compute_v86_bid_cents(100, 28, 0, bot_key="S7") == 100
-    assert compute_v86_bid_cents(100, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(110, 28, 0, bot_key="S7") == 100
-    assert compute_v86_bid_cents(110, 28, 0, bot_key="S8") == 105
-    assert compute_v86_bid_cents(149, 28, 0, bot_key="S7") == 100
-    assert compute_v86_bid_cents(149, 28, 0, bot_key="S8") == 115
-    assert compute_v86_bid_cents(150, 28, 0, bot_key="S7") == 100
-    assert compute_v86_bid_cents(150, 28, 0, bot_key="S8") == 115
-    assert compute_v86_bid_cents(400, 28, 0, bot_key="S7") == 100
-    assert compute_v86_bid_cents(400, 28, 0, bot_key="S8") == 116
-    assert compute_v86_bid_cents(550, 28, 0, bot_key="S7") == 116
-    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 160
-    assert compute_v86_bid_cents(800, 28, 0, bot_key="S7") == 168
-    assert compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 232
-    assert compute_v86_bid_cents(1200, 28, 0, bot_key="S7") == 252
-    assert compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 348
-    for chk_b in (110, 129, 130, 149, 150, 200, 300, 400, 500, 550, 800, 1200, 1500):
-        b7 = compute_v86_bid_cents(chk_b, 28, 0, bot_key="S7")
-        b8 = compute_v86_bid_cents(chk_b, 28, 0, bot_key="S8")
-        assert 100 <= b7 < b8 <= chk_b, f"Collision or bound error at {chk_b}: s7={b7}, s8={b8}"
+    assert compute_v86_bid_cents(99, 28, 0, bot_key="S8") == 21
+    for chk_b in (100, 110, 149, 150, 200, 300, 400, 450):
+        assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S7") == 100
+        assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S8") == 100
+    assert compute_v86_bid_cents(500, 28, 0, bot_key="S8") == 105
+    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 116
+    assert compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 168
+    assert compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 252
     assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 8200
+    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 8200
     assert evaluate_intent_pre_bid({"title": "Big >500", "budgetCents": 50001})["bid_safe"] is False
     msg = build_bid_message("CLOUD_1", safe_item)
     assert not any(w in msg.lower() for w in RULE15_FORBIDDEN_WORDS)
