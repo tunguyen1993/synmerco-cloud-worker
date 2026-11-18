@@ -31,7 +31,7 @@ MAX_RELAY_BYTES = 6 * 1024 * 1024
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
 SAFE_AUTO_CAP_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$")
 STARTER_RATECARD_CAPS = ("research", "data_apis", "live-data", "general")
-LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 21, "S9": 21, "S10": 21, "S11": 21, "S12": 21, "S13": 21, "S14": 21, "S15": 21, "S16": 21}
+LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 15, "S9": 15, "S10": 15, "S11": 15, "S12": 15, "S13": 15, "S14": 15, "S15": 15, "S16": 15}
 LOW_CAPTURE_FLOOR_BY_BOT: dict[str, int] = {"S7": 100, "S8": 100, "S9": 100, "S10": 100, "S11": 100, "S12": 100, "S13": 100, "S14": 100, "S15": 100, "S16": 100}
 ALLOWED_RELAY_PATH_RE = re.compile(
     r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|submit-proof|data-files(?:/[A-Za-z0-9_-]+/complete)?))?$"
@@ -227,7 +227,7 @@ def compute_v86_bid_cents(
         raw = _round_pct_cents(effective_budget, pct)
         bot_floor = LOW_CAPTURE_FLOOR_BY_BOT.get(norm_key, base_floor) if effective_budget >= 100 else 1
         return max(bot_floor, min(effective_budget, raw))
-    ratio_pct = 88 if score >= 65 else (82 if score >= 45 else 74)
+    ratio_pct = 78 if score >= 75 else (34 if score >= 55 else 28)
     return max(base_floor, min(effective_budget, _round_pct_cents(effective_budget, ratio_pct)))
 
 
@@ -758,22 +758,24 @@ def _run_self_test() -> dict[str, Any]:
     assert compute_v86_bid_cents(2500, 28, 0) == 825
     assert compute_v86_bid_cents(800, 28, 0, target_bid_cents=500) == 500
     assert compute_v86_bid_cents(350, 28, 0, target_bid_cents=500) == 350
-    assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 8800
-    assert compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 8200
-    assert compute_v86_bid_cents(500, 48, 1) == 410
-    # Verify S7 & S8 low-capture $1.00 (100c) floor and 21% ratio + graduation
+    assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 3400
+    assert compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 3400
+    assert compute_v86_bid_cents(10000, 78, 3, target_bid_cents=500) == 7800
+    assert compute_v86_bid_cents(500, 48, 1) == 140
+    # Verify S7 (21%) & S8..S16 (15%) low-capture $1.00 (100c) floor + Pro-climb graduation
     assert compute_v86_bid_cents(1, 28, 0, bot_key="S7") == 1
     assert compute_v86_bid_cents(99, 28, 0, bot_key="S7") == 21
-    assert compute_v86_bid_cents(99, 28, 0, bot_key="S8") == 21
+    assert compute_v86_bid_cents(99, 28, 0, bot_key="S8") == 15
     for chk_b in (100, 110, 149, 150, 200, 300, 400, 450):
         assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S7") == 100
         assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(500, 28, 0, bot_key="S8") == 105
-    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 116
-    assert compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 168
-    assert compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 252
-    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 8200
-    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 8200
+    assert compute_v86_bid_cents(500, 28, 0, bot_key="S7") == 105
+    assert compute_v86_bid_cents(500, 28, 0, bot_key="S8") == 100
+    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 100
+    assert compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 120
+    assert compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 180
+    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 2800
+    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 2800
     assert evaluate_intent_pre_bid({"title": "Big >500", "budgetCents": 50001})["bid_safe"] is False
     msg = build_bid_message("CLOUD_1", safe_item)
     assert not any(w in msg.lower() for w in RULE15_FORBIDDEN_WORDS)
@@ -907,7 +909,8 @@ def _run_self_test() -> dict[str, Any]:
     worker.step_once()
     assert len(mock_svcs) == svc_count_before, "Expected no duplicate starter /v1/services writes after cold boot"
     assert worker.public_health()["bots"][0]["passed"] == 1
-    assert any(b["amountCents"] == 2050 for b in mock_bids), f"Expected graduated 82% of $25 bid in {mock_bids}"
+    assert any(b["amountCents"] == 700 for b in mock_bids), f"Expected Pro-climb 28% of $25 bid (700c) in {mock_bids}"
+    assert compute_v86_bid_cents(2500, 78, 3) == 1950
 
     sync_tok = "sync-tok-test"
     app_srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(worker, sync_tok, ""))
