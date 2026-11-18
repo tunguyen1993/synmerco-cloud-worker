@@ -9,11 +9,13 @@ Synmerco 24/7 Cloud Worker & Doorbell Server for Render Free Web Services.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import hmac
 import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -28,6 +30,8 @@ HEARTBEAT_INTERVAL_SEC = 50
 SCORE_REFRESH_SEC = 300
 MAX_DOORBELL_BYTES = 262144
 MAX_RELAY_BYTES = 6 * 1024 * 1024
+PROOF_STORE_DIR = os.path.join(tempfile.gettempdir(), "synmerco_proofs")
+PROOF_PATH_RE = re.compile(r"^/proof/([0-9a-f]{64})\.md$")
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
 SAFE_AUTO_CAP_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$")
 STARTER_RATECARD_CAPS = ("research", "data_apis", "live-data", "general")
@@ -513,12 +517,7 @@ class SynmercoCloudWorker:
             esc_res = self.api_call("/v1/escrows?role=seller&limit=20", method="GET", api_key=api_key)
             escrows = esc_res.get("escrows") or esc_res.get("items") or []
             active_escrows = [
-                {
-                    "id": e.get("escrowId") or e.get("id"),
-                    "state": e.get("state"),
-                    "title": e.get("title") or e.get("jobTitle"),
-                    "netToSellerCents": e.get("netToSellerCents"),
-                }
+                {"id": e.get("escrowId") or e.get("id"), "state": e.get("state"), "title": e.get("title") or e.get("jobTitle"), "netToSellerCents": e.get("netToSellerCents")}
                 for e in escrows
                 if str(e.get("state") or "") in {"funded", "revision_requested", "disputed"}
             ]
@@ -638,15 +637,9 @@ class SynmercoCloudWorker:
     def _public_health_unlocked(self) -> dict[str, Any]:
         """Build secret-free health payload (caller must hold self.lock)."""
         return {
-            "ok": True,
-            "service": "synmerco-cloud-worker",
-            "uptimeSec": round(time.time() - self.start_ts, 1),
-            "configuredBots": len(self.bots),
-            "autoBid": self.auto_bid,
-            "targetBidCents": self.target_bid_cents,
-            "doorbellHits": self.doorbell_hits,
-            "bots": list(self.bot_states.values()),
-            "ts": utc_now_iso(),
+            "ok": True, "service": "synmerco-cloud-worker", "uptimeSec": round(time.time() - self.start_ts, 1),
+            "configuredBots": len(self.bots), "autoBid": self.auto_bid, "targetBidCents": self.target_bid_cents,
+            "doorbellHits": self.doorbell_hits, "bots": list(self.bot_states.values()), "ts": utc_now_iso(),
         }
 
     def public_health(self) -> dict[str, Any]:
@@ -657,11 +650,7 @@ class SynmercoCloudWorker:
     def authenticated_state(self) -> dict[str, Any]:
         """Return full operational events/state for authenticated sync."""
         with self.lock:
-            return {
-                **self._public_health_unlocked(),
-                "recentEvents": list(self.recent_events),
-                "attemptedBidsCount": len(self.attempted_intent_bids),
-            }
+            return {**self._public_health_unlocked(), "recentEvents": list(self.recent_events), "attemptedBidsCount": len(self.attempted_intent_bids)}
 
 
 def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: str) -> type[BaseHTTPRequestHandler]:
@@ -690,8 +679,47 @@ def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: s
                 return False
             return True
 
+        def _read_raw_body(self, max_bytes: int) -> bytes | None:
+            try:
+                content_len = min(max(0, int(self.headers.get("Content-Length") or "0")), max_bytes)
+            except ValueError:
+                self._send_json(400, {"ok": False, "error": "bad_content_length"})
+                return None
+            return self.rfile.read(content_len) if content_len > 0 else b""
+
+        def _serve_proof(self, sha_hex: str, head_only: bool = False) -> None:
+            fpath = os.path.join(PROOF_STORE_DIR, f"{sha_hex}.md")
+            if not os.path.isfile(fpath):
+                self._send_json(404, {"ok": False, "error": "proof_not_found"})
+                return
+            with open(fpath, "rb") as fh:
+                data = fh.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(data)
+
+        def do_HEAD(self) -> None:
+            path = urllib.parse.urlparse(self.path).path
+            m = PROOF_PATH_RE.match(path)
+            if m:
+                self._serve_proof(m.group(1), head_only=True)
+            elif path in {"/", "/health"}:
+                self.send_response(200)
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         def do_GET(self) -> None:
             path = urllib.parse.urlparse(self.path).path
+            m = PROOF_PATH_RE.match(path)
+            if m:
+                self._serve_proof(m.group(1))
+                return
             if path in {"/", "/health"}:
                 self._send_json(200, worker.public_health())
                 return
@@ -703,28 +731,39 @@ def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: s
 
         def do_POST(self) -> None:
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/proof-pin":
+                if not self._check_sync_auth():
+                    return
+                raw_body = self._read_raw_body(MAX_RELAY_BYTES)
+                if raw_body is None:
+                    return
+                sha_hex = hashlib.sha256(raw_body).hexdigest()
+                os.makedirs(PROOF_STORE_DIR, exist_ok=True)
+                dst = os.path.join(PROOF_STORE_DIR, f"{sha_hex}.md")
+                tmp = f"{dst}.{threading.get_ident()}.tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(raw_body)
+                os.replace(tmp, dst)
+                self._send_json(201, {"ok": True, "sha256": sha_hex, "bytes": len(raw_body), "path": f"/proof/{sha_hex}.md"})
+                return
             if path == "/api/synmerco":
                 if not self._check_sync_auth():
                     return
-                raw_len = self.headers.get("Content-Length") or "0"
-                try:
-                    content_len = min(max(0, int(raw_len)), MAX_RELAY_BYTES)
-                except ValueError:
-                    self._send_json(400, {"ok": False, "error": "bad_content_length"})
+                raw_body = self._read_raw_body(MAX_RELAY_BYTES)
+                if raw_body is None:
                     return
-                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
                 try:
-                    req_obj = json.loads(raw_body.decode("utf-8"))
+                    req_obj = json.loads((raw_body or b"{}").decode("utf-8"))
                 except json.JSONDecodeError:
                     self._send_json(400, {"ok": False, "error": "invalid_json"})
                     return
-                relay_path = str(req_obj.get("path") or "").strip()
-                relay_method = str(req_obj.get("method") or "POST").strip().upper()
-                relay_body = req_obj.get("body") if isinstance(req_obj.get("body"), dict) else None
-                bot_key = str(req_obj.get("botKey") or "").strip() or None
-                res = worker.relay_escrow_call(relay_path, relay_method, relay_body, bot_key=bot_key)
-                status = int(res.get("http_status") or 200) if not res.get("ok", True) else 200
-                self._send_json(status, res)
+                res = worker.relay_escrow_call(
+                    str(req_obj.get("path") or "").strip(),
+                    str(req_obj.get("method") or "POST").strip().upper(),
+                    req_obj.get("body") if isinstance(req_obj.get("body"), dict) else None,
+                    bot_key=str(req_obj.get("botKey") or "").strip() or None,
+                )
+                self._send_json(int(res.get("http_status") or 200) if not res.get("ok", True) else 200, res)
                 return
 
             if path not in {"/doorbell", "/webhook/synmerco"}:
@@ -732,21 +771,14 @@ def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: s
                 return
             if webhook_secret:
                 provided = self.headers.get("X-Webhook-Secret") or self.headers.get("Authorization") or ""
-                if not (
-                    hmac.compare_digest(provided.encode("utf-8"), webhook_secret.encode("utf-8"))
-                    or hmac.compare_digest(provided.encode("utf-8"), f"Bearer {webhook_secret}".encode("utf-8"))
-                ):
+                if not (hmac.compare_digest(provided.encode("utf-8"), webhook_secret.encode("utf-8")) or hmac.compare_digest(provided.encode("utf-8"), f"Bearer {webhook_secret}".encode("utf-8"))):
                     self._send_json(401, {"ok": False, "error": "invalid_webhook_secret"})
                     return
-            raw_len = self.headers.get("Content-Length") or "0"
-            try:
-                content_len = min(max(0, int(raw_len)), MAX_DOORBELL_BYTES)
-            except ValueError:
-                self._send_json(400, {"ok": False, "error": "bad_content_length"})
+            body_raw = self._read_raw_body(MAX_DOORBELL_BYTES)
+            if body_raw is None:
                 return
-            body_raw = self.rfile.read(content_len) if content_len > 0 else b"{}"
             try:
-                parsed = json.loads(body_raw.decode("utf-8", errors="replace") or "{}")
+                parsed = json.loads((body_raw or b"{}").decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
                 parsed = {}
             worker.doorbell_hits += 1
@@ -761,40 +793,24 @@ def make_handler(worker: SynmercoCloudWorker, sync_token: str, webhook_secret: s
 
 
 def _run_self_test() -> dict[str, Any]:
-    """Run local adversarial tests covering S7/S8 low-capture pricing, rateCards, graduation, and HTTP server."""
+    """Run local adversarial tests covering S7/S8 low-capture pricing, rateCards, graduation, proof pin, and HTTP server."""
     assert evaluate_intent_pre_bid({"title": "Send USDC bond", "budgetCents": 500})["bid_safe"] is False
     assert evaluate_intent_pre_bid({"title": "Post on Discord", "budgetCents": 500})["bid_safe"] is False
-    assert evaluate_intent_pre_bid(
-        {"title": "Two pulls", "budgetCents": 500, "deadline": "2020-01-01T00:00:00Z"}, now_ts=1700000000.0
-    )["bid_safe"] is False
+    assert evaluate_intent_pre_bid({"title": "Two pulls", "budgetCents": 500, "deadline": "2020-01-01T00:00:00Z"}, now_ts=1700000000.0)["bid_safe"] is False
     safe_item = {"title": "Verify SEC filing EX-99.1", "budgetCents": 500, "deadline": "2099-01-01T00:00:00Z"}
     assert evaluate_intent_pre_bid(safe_item, now_ts=1700000000.0)["bid_safe"] is True
-
-    assert compute_v86_bid_cents(500, 28, 0) == 275
-    assert compute_v86_bid_cents(2500, 28, 0) == 825
-    assert compute_v86_bid_cents(800, 28, 0, target_bid_cents=500) == 500
-    assert compute_v86_bid_cents(350, 28, 0, target_bid_cents=500) == 350
-    assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 3400
-    assert compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 3400
-    assert compute_v86_bid_cents(10000, 78, 3, target_bid_cents=500) == 7800
-    assert compute_v86_bid_cents(500, 48, 1) == 140
-    # Verify S7 (21%) & S8..S16 (15%) low-capture $1.00 (100c) floor + Pro-climb graduation
-    assert compute_v86_bid_cents(1, 28, 0, bot_key="S7") == 1
-    assert compute_v86_bid_cents(99, 28, 0, bot_key="S7") == 21
-    assert compute_v86_bid_cents(99, 28, 0, bot_key="S8") == 15
+    assert compute_v86_bid_cents(500, 28, 0) == 275 and compute_v86_bid_cents(2500, 28, 0) == 825
+    assert compute_v86_bid_cents(800, 28, 0, target_bid_cents=500) == 500 and compute_v86_bid_cents(350, 28, 0, target_bid_cents=500) == 350
+    assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 3400 and compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 3400
+    assert compute_v86_bid_cents(10000, 78, 3, target_bid_cents=500) == 7800 and compute_v86_bid_cents(500, 48, 1) == 140
+    assert compute_v86_bid_cents(1, 28, 0, bot_key="S7") == 1 and compute_v86_bid_cents(99, 28, 0, bot_key="S7") == 21 and compute_v86_bid_cents(99, 28, 0, bot_key="S8") == 15
     for chk_b in (100, 110, 149, 150, 200, 300, 400, 450):
-        assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S7") == 100
-        assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(500, 28, 0, bot_key="S7") == 105
-    assert compute_v86_bid_cents(500, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 120
-    assert compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 180
-    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 2800
-    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 2800
+        assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S7") == 100 and compute_v86_bid_cents(chk_b, 28, 0, bot_key="S8") == 100
+    assert compute_v86_bid_cents(500, 28, 0, bot_key="S7") == 105 and compute_v86_bid_cents(500, 28, 0, bot_key="S8") == 100
+    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 100 and compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 120 and compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 180
+    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 2800 and compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 2800
     assert evaluate_intent_pre_bid({"title": "Big >500", "budgetCents": 50001})["bid_safe"] is False
-    msg = build_bid_message("CLOUD_1", safe_item)
-    assert not any(w in msg.lower() for w in RULE15_FORBIDDEN_WORDS)
+    assert not any(w in build_bid_message("CLOUD_1", safe_item).lower() for w in RULE15_FORBIDDEN_WORDS)
 
     mock_bids: list[dict[str, Any]] = []
     mock_proofs: list[dict[str, Any]] = []
@@ -908,29 +924,23 @@ def _run_self_test() -> dict[str, Any]:
 
     # Verify forbidden relay path rejected (403) and allowed submit-proof forwarded (200)
     try:
-        req_bad = urllib.request.Request(
-            f"http://127.0.0.1:{app_port}/api/synmerco",
-            data=json.dumps({"path": "/v1/wallets/transfer", "method": "POST"}).encode("utf-8"),
-            headers={"Authorization": f"Bearer {sync_tok}", "Content-Type": "application/json"},
-            method="POST",
-        )
+        req_bad = urllib.request.Request(f"http://127.0.0.1:{app_port}/api/synmerco", data=json.dumps({"path": "/v1/wallets/transfer", "method": "POST"}).encode("utf-8"), headers={"Authorization": f"Bearer {sync_tok}", "Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(req_bad, timeout=5)
         raise AssertionError("Expected 403 on forbidden relay path")
     except urllib.error.HTTPError as exc:
         assert exc.code == 403
 
-    req_ok = urllib.request.Request(
-        f"http://127.0.0.1:{app_port}/api/synmerco",
-        data=json.dumps({
-            "path": "/v1/escrows/esc_123/submit-proof",
-            "method": "POST",
-            "body": {"proofHash": "abc", "proofUri": "https://example.com/p.md"},
-        }).encode("utf-8"),
-        headers={"Authorization": f"Bearer {sync_tok}", "Content-Type": "application/json"},
-        method="POST",
-    )
+    req_ok = urllib.request.Request(f"http://127.0.0.1:{app_port}/api/synmerco", data=json.dumps({"path": "/v1/escrows/esc_123/submit-proof", "method": "POST", "body": {"proofHash": "abc", "proofUri": "https://example.com/p.md"}}).encode("utf-8"), headers={"Authorization": f"Bearer {sync_tok}", "Content-Type": "application/json"}, method="POST")
     ok_res = json.loads(urllib.request.urlopen(req_ok, timeout=5).read().decode("utf-8"))
     assert ok_res["submitted"] is True and len(mock_proofs) == 1
+
+    sample_md = b"# Test Proof\nExact UTF-8 payload.\n"
+    sample_sha = hashlib.sha256(sample_md).hexdigest()
+    pin_req = urllib.request.Request(f"http://127.0.0.1:{app_port}/api/proof-pin", data=sample_md, headers={"Authorization": f"Bearer {sync_tok}"}, method="POST")
+    pin_res = json.loads(urllib.request.urlopen(pin_req, timeout=5).read().decode("utf-8"))
+    assert pin_res["sha256"] == sample_sha and pin_res["path"] == f"/proof/{sample_sha}.md"
+    assert hashlib.sha256(urllib.request.urlopen(f"http://127.0.0.1:{app_port}{pin_res['path']}", timeout=5).read()).hexdigest() == sample_sha
+    assert urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{app_port}{pin_res['path']}", method="HEAD"), timeout=5).status == 200
 
     app_srv.shutdown()
     mock_srv.shutdown()
