@@ -82,8 +82,22 @@ def parse_cents(raw: Any) -> int:
         if not dec.is_finite():
             return 0
         return int(dec.to_integral_value(rounding=ROUND_HALF_UP))
-    except (InvalidOperation, ValueError, TypeError):
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
         return 0
+
+
+def _extract_min_bid_cents(res: dict[str, Any]) -> int:
+    """Extract minBidCents from a bid error dict, nested detail, or JSON error string."""
+    raw = str(res.get("error") or "")
+    try:
+        obj = json.loads(raw) if raw.lstrip().startswith("{") else {}
+    except Exception:
+        obj = {}
+    for src in (res, res.get("detail"), obj, obj.get("detail") if isinstance(obj, dict) else None):
+        if isinstance(src, dict) and src.get("minBidCents") is not None:
+            return parse_cents(src.get("minBidCents"))
+    m = re.search(r'"minBidCents"\s*:\s*(\d+)', raw)
+    return parse_cents(m.group(1) if m else 0)
 
 
 def mask_did(did: str) -> str:
@@ -414,10 +428,7 @@ class SynmercoCloudWorker:
                 added.append(cap)
             elif http_code != 409:
                 had_write_err = True
-                self._record_event(
-                    "rate_card_warn",
-                    {"botKey": bkey, "capability": cap, "httpStatus": http_code, "error": str(svc_res.get("error") or "")[:120]},
-                )
+                self._record_event("rate_card_warn", {"botKey": bkey, "capability": cap, "httpStatus": http_code, "error": str(svc_res.get("error") or "")[:120]})
         if added:
             self._record_event("rate_card_sync", {"botKey": bkey, "rateCents": ask_cents, "added": added})
         if not had_write_err:
@@ -583,39 +594,44 @@ class SynmercoCloudWorker:
                         self.attempted_intent_bids.add(dedupe_key)
                         continue
                     amount_cents = compute_v86_bid_cents(
-                        gate["budget_cents"],
-                        score,
-                        passed,
-                        target_bid_cents=self.target_bid_cents,
-                        bot_key=bkey,
-                        bid_ratio_pct=self.bid_ratio_pct,
+                        gate["budget_cents"], score, passed, target_bid_cents=self.target_bid_cents,
+                        bot_key=bkey, bid_ratio_pct=self.bid_ratio_pct,
                     )
                     min_bid_cents = parse_cents(item.get("minBidCents") or 0)
-                    if 0 < min_bid_cents <= gate["budget_cents"]:
+                    if min_bid_cents > gate["budget_cents"]:
+                        self.attempted_intent_bids.add(dedupe_key)
+                        continue
+                    if 0 < min_bid_cents:
                         amount_cents = max(min_bid_cents, amount_cents)
                     bid_msg = build_bid_message(bkey, item)
                     bid_path = f"/v1/intents/{urllib.parse.quote(iid)}/bids"
                     bid_payload = {"bidderDid": did, "amountCents": amount_cents, "message": bid_msg}
                     bid_res = self.api_call(bid_path, method="POST", body=bid_payload, api_key=api_key)
-                    if not bid_res.get("ok", True) or bid_res.get("error"):
-                        added_cap = self._maybe_auto_register_capability(bot, str(bid_res.get("error") or ""), passed=passed)
-                        if added_cap:
+                    tried_min = False
+                    tried_cap = False
+                    for _ in range(2):
+                        err_txt = str(bid_res.get("error") or "")
+                        if not err_txt and bid_res.get("ok", True):
+                            break
+                        if not tried_min and "below_minimum_bid" in err_txt:
+                            tried_min = True
+                            err_min = _extract_min_bid_cents(bid_res)
+                            if 0 < err_min <= gate["budget_cents"] and err_min > amount_cents:
+                                amount_cents = err_min
+                                bid_payload["amountCents"] = err_min
+                                bid_res = self.api_call(bid_path, method="POST", body=bid_payload, api_key=api_key)
+                                continue
+                        if not tried_cap and self._maybe_auto_register_capability(bot, err_txt, passed=passed):
+                            tried_cap = True
                             bid_res = self.api_call(bid_path, method="POST", body=bid_payload, api_key=api_key)
+                            continue
+                        break
                     bid_ok = bool(bid_res.get("ok", True) and not bid_res.get("error"))
                     err_str = str(bid_res.get("error") or "")
                     http_code = int(bid_res.get("http_status") or 0)
                     if bid_ok or "already_bid" in err_str or http_code in {400, 403, 404, 412, 422}:
                         self.attempted_intent_bids.add(dedupe_key)
-                    self._record_event(
-                        "auto_bid",
-                        {
-                            "botKey": bkey,
-                            "intentId": iid,
-                            "amountCents": amount_cents,
-                            "ok": bid_ok,
-                            "error": bid_res.get("error"),
-                        },
-                    )
+                    self._record_event("auto_bid", {"botKey": bkey, "intentId": iid, "amountCents": amount_cents, "ok": bid_ok, "error": bid_res.get("error")})
                 except Exception as exc:
                     self._record_event("bid_exception", {"botKey": bkey, "intentId": iid, "error": repr(exc)[:180]})
 
@@ -790,17 +806,19 @@ def _run_self_test() -> dict[str, Any]:
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
 
+        def _json(self, code: int, obj: Any) -> None:
+            raw = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
         def do_POST(self) -> None:
             n = int(self.headers.get("Content-Length") or "0")
             body = json.loads(self.rfile.read(n).decode("utf-8")) if n > 0 else {}
             if self.path == "/v1/agents/heartbeat":
-                out = {
-                    "ok": True,
-                    "readiness": {"live": True},
-                    "busy": bool(mock_state["escrows"]),
-                    "trackRecord": {"passed": mock_state["passed"]},
-                    "jobsForYou": [],
-                }
+                out = {"ok": True, "readiness": {"live": True}, "busy": bool(mock_state["escrows"]), "trackRecord": {"passed": mock_state["passed"]}, "jobsForYou": []}
             elif self.path == "/v1/agents/register":
                 mock_regs.append(body)
                 if "clinical-audit" in (body.get("capabilities") or []):
@@ -812,13 +830,9 @@ def _run_self_test() -> dict[str, Any]:
                 out = {"ok": True, "listingId": "svc_test_1"}
             elif "/bids" in self.path:
                 if not mock_state["has_clinical"]:
-                    err_raw = json.dumps({"ok": False, "error": 'agent_not_compatible: needs capability "clinical-audit"'}).encode("utf-8")
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(err_raw)))
-                    self.end_headers()
-                    self.wfile.write(err_raw)
-                    return
+                    return self._json(400, {"ok": False, "error": 'agent_not_compatible: needs capability "clinical-audit"'})
+                if "/int_low/" in self.path and int(body.get("amountCents") or 0) < 180:
+                    return self._json(400, {"error": "below_minimum_bid", "minBidCents": 180})
                 mock_bids.append(body)
                 out = {"ok": True, "bidId": "bid_test_1"}
             elif self.path.endswith("/submit-proof"):
@@ -826,55 +840,28 @@ def _run_self_test() -> dict[str, Any]:
                 out = {"ok": True, "submitted": True}
             else:
                 out = {"ok": False}
-            raw = json.dumps(out).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            self._json(200, out)
 
         def do_GET(self) -> None:
             if self.path.startswith("/v1/agents/"):
                 sc = 48 if mock_state["passed"] > 0 else 28
-                tr = "Silver" if mock_state["passed"] > 0 else "New"
-                out = {
-                    "synmercoScore": sc,
-                    "tier": tr,
-                    "stats": {"passed": mock_state["passed"]},
-                    "rateCards": [],
-                }
+                out = {"synmercoScore": sc, "tier": "Silver" if mock_state["passed"] > 0 else "New", "stats": {"passed": mock_state["passed"]}, "rateCards": []}
             elif self.path.startswith("/v1/services"):
-                out = {
-                    "services": [
-                        {
-                            "providerDid": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD",
-                            "capability": c,
-                            "status": "active",
-                        }
-                        for c in sorted(mock_state["rate_caps"])
-                    ]
-                }
+                out = {"services": [{"providerDid": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD", "capability": c, "status": "active"} for c in sorted(mock_state["rate_caps"])]}
             elif self.path.startswith("/v1/escrows"):
                 out = {"escrows": list(mock_state["escrows"])}
             elif self.path.startswith("/v1/intents"):
-                out = {
-                    "intents": [
-                        {"intentId": "int_bad_dl", "title": "Bad item", "budgetCents": 200, "deadline": "bad"},
-                        {"intentId": "int_low", "title": "Low $2 job", "budgetCents": 200, "deadline": "2099-01-01T00:00:00Z"},
-                        {"intentId": "int_1", **safe_item},
-                        {"intentId": "int_gt15_skip", "title": "Skip >$15 for new", "budgetCents": 2500, "deadline": "2099-01-01T00:00:00Z"},
-                    ]
-                }
+                out = {"intents": [
+                    {"intentId": "int_bad_dl", "title": "Bad item", "budgetCents": 200, "deadline": "bad"},
+                    {"intentId": "int_low", "title": "Low $2 job", "budgetCents": 200, "deadline": "2099-01-01T00:00:00Z"},
+                    {"intentId": "int_1", **safe_item},
+                    {"intentId": "int_gt15_skip", "title": "Skip >$15 for new", "budgetCents": 2500, "deadline": "2099-01-01T00:00:00Z"},
+                ]}
             elif self.path.startswith("/v1/jobs"):
                 out = {"jobs": [{"intentId": "int_from_jobs", "title": "Open job feed", "status": "open", "budgetCents": 600, "deadline": "2099-01-01T00:00:00Z"}]}
             else:
                 out = {}
-            raw = json.dumps(out).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            self._json(200, out)
 
     mock_srv = ThreadingHTTPServer(("127.0.0.1", 0), MockSynmerco)
     mock_port = mock_srv.server_address[1]
@@ -884,20 +871,19 @@ def _run_self_test() -> dict[str, Any]:
     worker = SynmercoCloudWorker(
         validate_api_base(f"http://127.0.0.1:{mock_port}", allow_local_test=True),
         [{
-            "botKey": "S7",
-            "did": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD",
-            "apiKey": secret_key,
-            "displayName": "MedWatchTest",
+            "botKey": "S7", "did": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD",
+            "apiKey": secret_key, "displayName": "MedWatchTest",
             "description": "Cloud test research specialist verifying SEC filings and regulatory APIs accurately.",
-            "caps": ["research", "general"],
-            "doorbellUrl": "https://synmerco-worker-s7.onrender.com/doorbell",
+            "caps": ["research", "general"], "doorbellUrl": "https://synmerco-worker-s7.onrender.com/doorbell",
         }],
         auto_bid=True,
     )
+    assert _extract_min_bid_cents({"error": '{"error":"below_minimum_bid","minBidCents":300}'}) == 300
+    assert _extract_min_bid_cents({"error": '{"detail":{"minBidCents":300}}'}) == 300
     worker.step_once()
     assert len(mock_regs) == 2 and "clinical-audit" in mock_regs[-1]["capabilities"]
     assert mock_regs[0].get("doorbellUrl") == "https://synmerco-worker-s7.onrender.com/doorbell"
-    assert sorted(b["amountCents"] for b in mock_bids) == [100, 105, 126], f"unexpected S7 mock_bids={mock_bids}"
+    assert sorted(b["amountCents"] for b in mock_bids) == [105, 126, 180], f"unexpected S7 mock_bids={mock_bids}"
     assert sorted(s["rateCents"] for s in mock_svcs) == [100, 100, 100]
     assert worker.public_health()["bots"][0]["score"] == 28
 
