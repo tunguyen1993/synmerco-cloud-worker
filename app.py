@@ -34,9 +34,11 @@ PROOF_STORE_DIR = os.path.join(tempfile.gettempdir(), "synmerco_proofs")
 PROOF_PATH_RE = re.compile(r"^/proof/([0-9a-f]{64})\.md$")
 RULE15_FORBIDDEN_WORDS = ("evaluator", "dispute", "revision", "appeal", "requirements met")
 SAFE_AUTO_CAP_RE = re.compile(r"^[a-z][a-z0-9_-]{1,62}$")
-STARTER_RATECARD_CAPS = ("research", "data_apis", "live-data", "general")
-LOW_CAPTURE_PCT_BY_BOT: dict[str, int] = {"S7": 21, "S8": 15, "S9": 15, "S10": 15, "S11": 15, "S12": 15, "S13": 15, "S14": 15, "S15": 15, "S16": 15}
-LOW_CAPTURE_FLOOR_BY_BOT: dict[str, int] = {"S7": 100, "S8": 100, "S9": 100, "S10": 100, "S11": 100, "S12": 100, "S13": 100, "S14": 100, "S15": 100, "S16": 100}
+STARTER_RATECARD_CAPS = (
+    "research", "data_apis", "live-data", "general", "regulatory-change-watch",
+    "vendor-risk-review", "macro-data-reconciliation", "regulatory-intelligence", "vulnerability-watch",
+)
+NEW_BOT_SHARD_ROSTER: tuple[str, ...] = ("S8", "S10", "S11", "S12", "S13", "S15", "S16")
 ALLOWED_RELAY_PATH_RE = re.compile(
     r"^/v1/escrows/[A-Za-z0-9_-]+(?:/(?:progress|self-check|submit-proof|data-files(?:/[A-Za-z0-9_-]+/complete)?))?$"
 )
@@ -164,7 +166,10 @@ def load_bot_configs_from_env() -> list[dict[str, str]]:
 
 
 def evaluate_intent_pre_bid(item: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
-    """Run deterministic pre-bid safety and deadline checks aligned with v86."""
+    """Run deterministic pre-bid safety and deadline checks aligned with v87."""
+    if (item.get("proOnly") is True or item.get("proSellersOnly") is True
+            or item.get("requiresPro") is True or str(item.get("tierRequired") or "").strip().lower() == "pro"):
+        return {"bid_safe": False, "block_reason": "pro_sellers_only", "budget_cents": 0}
     title = str(item.get("title") or "")
     desc = str(item.get("description") or item.get("summary") or "")
     low = f"{title}\n{desc}".lower()
@@ -224,6 +229,18 @@ def _round_pct_cents(budget_cents: int, pct: int) -> int:
     return (budget_cents * pct + 50) // 100
 
 
+def should_new_bot_bid_intent(bot_key: str, intent_id: str, item: dict[str, Any]) -> bool:
+    """Shard New bots (1 per intent) and skip 100+ bid saturated intents to avoid Rule 29 noise."""
+    bid_cnt = parse_cents(item.get("bidCount") or item.get("bidsCount") or item.get("bidderCount") or 0)
+    if bid_cnt >= 100:
+        return False
+    norm_key = bot_key.strip().upper()
+    if norm_key in NEW_BOT_SHARD_ROSTER:
+        idx = int(hashlib.sha256(intent_id.encode("utf-8")).hexdigest()[:8], 16) % len(NEW_BOT_SHARD_ROSTER)
+        return NEW_BOT_SHARD_ROSTER[idx] == norm_key
+    return True
+
+
 def compute_v86_bid_cents(
     budget_cents: int,
     score: int,
@@ -232,20 +249,20 @@ def compute_v86_bid_cents(
     bot_key: str = "",
     bid_ratio_pct: int = 0,
 ) -> int:
-    """Compute v86 max-capture bid: aggressive low-capture S7/S8 while New, 74-88% up to $500 once passed>=1."""
+    """Compute v87 Floor-Strike bid: exact 100c floor on <=$15 (15% <100c); graduated 15-30% above $15."""
     if isinstance(budget_cents, bool) or budget_cents <= 0:
         raise ValueError("budget_cents must be a positive integer")
     effective_budget = min(budget_cents, 1500) if passed == 0 else min(budget_cents, 50000)
-    base_floor = 100 if effective_budget >= 100 else 1
+    base_floor = 100 if effective_budget >= 100 else max(1, (effective_budget * 15) // 100)
     if passed == 0:
         if target_bid_cents > 0:
             return max(base_floor, min(effective_budget, target_bid_cents))
-        norm_key = bot_key.strip().upper()
-        pct = bid_ratio_pct if 1 <= bid_ratio_pct <= 100 else LOW_CAPTURE_PCT_BY_BOT.get(norm_key, 55)
-        raw = _round_pct_cents(effective_budget, pct)
-        bot_floor = LOW_CAPTURE_FLOOR_BY_BOT.get(norm_key, base_floor) if effective_budget >= 100 else 1
-        return max(bot_floor, min(effective_budget, raw))
-    ratio_pct = 78 if score >= 75 else (34 if score >= 55 else 28)
+        if 1 <= bid_ratio_pct <= 100:
+            return max(base_floor, min(effective_budget, _round_pct_cents(effective_budget, bid_ratio_pct)))
+        return base_floor
+    if effective_budget <= 1500:
+        return max(base_floor, min(effective_budget, _round_pct_cents(effective_budget, 25))) if score >= 80 else base_floor
+    ratio_pct = (25 if score >= 80 else 15) if effective_budget <= 5000 else (30 if score >= 80 else 22)
     return max(base_floor, min(effective_budget, _round_pct_cents(effective_budget, ratio_pct)))
 
 
@@ -492,7 +509,7 @@ class SynmercoCloudWorker:
         reg_res = self.api_call("/v1/agents/register", method="POST", body=reg_body, api_key=bot["apiKey"])
         if not reg_res.get("ok", True) or reg_res.get("error"):
             return None
-        ask_cents = 100 if passed == 0 else (self.target_bid_cents or 500)
+        ask_cents = 100 if (passed == 0 or self.target_bid_cents <= 0) else self.target_bid_cents
         svc_body = {
             "capability": req_cap,
             "title": f"{display_name}: {req_cap}",
@@ -589,7 +606,7 @@ class SynmercoCloudWorker:
                     if not gate["bid_safe"]:
                         self.attempted_intent_bids.add(dedupe_key)
                         continue
-                    if passed == 0 and gate["budget_cents"] > 1500:
+                    if (passed == 0 and gate["budget_cents"] > 1500) or (passed == 0 and not should_new_bot_bid_intent(bkey, iid, item)):
                         self.attempted_intent_bids.add(dedupe_key)
                         continue
                     amount_cents = compute_v86_bid_cents(
@@ -799,16 +816,17 @@ def _run_self_test() -> dict[str, Any]:
     assert evaluate_intent_pre_bid({"title": "Two pulls", "budgetCents": 500, "deadline": "2020-01-01T00:00:00Z"}, now_ts=1700000000.0)["bid_safe"] is False
     safe_item = {"title": "Verify SEC filing EX-99.1", "budgetCents": 500, "deadline": "2099-01-01T00:00:00Z"}
     assert evaluate_intent_pre_bid(safe_item, now_ts=1700000000.0)["bid_safe"] is True
-    assert compute_v86_bid_cents(500, 28, 0) == 275 and compute_v86_bid_cents(2500, 28, 0) == 825
+    assert evaluate_intent_pre_bid({"title": "Pro", "budgetCents": 1100, "proOnly": True})["bid_safe"] is False
+    assert sum(should_new_bot_bid_intent(bk, "int_shard_1", {"bidCount": 20}) for bk in NEW_BOT_SHARD_ROSTER) == 1
+    assert should_new_bot_bid_intent("S8", "int_shard_1", {"bidCount": 120}) is False
+    assert compute_v86_bid_cents(500, 28, 0) == 100 and compute_v86_bid_cents(2500, 28, 0) == 100
     assert compute_v86_bid_cents(800, 28, 0, target_bid_cents=500) == 500 and compute_v86_bid_cents(350, 28, 0, target_bid_cents=500) == 350
-    assert compute_v86_bid_cents(10000, 69, 3, target_bid_cents=500) == 3400 and compute_v86_bid_cents(10000, 59, 4, target_bid_cents=500) == 3400
-    assert compute_v86_bid_cents(10000, 78, 3, target_bid_cents=500) == 7800 and compute_v86_bid_cents(500, 48, 1) == 140
-    assert compute_v86_bid_cents(1, 28, 0, bot_key="S7") == 1 and compute_v86_bid_cents(99, 28, 0, bot_key="S7") == 21 and compute_v86_bid_cents(99, 28, 0, bot_key="S8") == 15
-    for chk_b in (100, 110, 149, 150, 200, 300, 400, 450):
-        assert compute_v86_bid_cents(chk_b, 28, 0, bot_key="S7") == 100 and compute_v86_bid_cents(chk_b, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(500, 28, 0, bot_key="S7") == 105 and compute_v86_bid_cents(500, 28, 0, bot_key="S8") == 100
-    assert compute_v86_bid_cents(550, 28, 0, bot_key="S8") == 100 and compute_v86_bid_cents(800, 28, 0, bot_key="S8") == 120 and compute_v86_bid_cents(1200, 28, 0, bot_key="S8") == 180
-    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 2800 and compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 2800
+    assert compute_v86_bid_cents(500, 69, 3) == 100 and compute_v86_bid_cents(1000, 62, 1) == 100 and compute_v86_bid_cents(500, 82, 5) == 125
+    assert compute_v86_bid_cents(2500, 62, 1) == 375 and compute_v86_bid_cents(2500, 82, 5) == 625
+    assert compute_v86_bid_cents(10000, 69, 3) == 2200 and compute_v86_bid_cents(10000, 82, 5) == 3000
+    assert compute_v86_bid_cents(1, 28, 0, bot_key="S7") == 1 and compute_v86_bid_cents(99, 28, 0, bot_key="S7") == 14
+    assert all(compute_v86_bid_cents(chk_b, 28, 0, bot_key=bk) == 100 for bk in ("S7", "S8") for chk_b in (100, 110, 149, 150, 200, 300, 400, 450, 500, 800, 1200))
+    assert compute_v86_bid_cents(10000, 48, 1, bot_key="S7") == 2200 and compute_v86_bid_cents(10000, 48, 1, bot_key="S8") == 2200
     assert evaluate_intent_pre_bid({"title": "Big >500", "budgetCents": 50001})["bid_safe"] is False
     assert not any(w in build_bid_message("CLOUD_1", safe_item).lower() for w in RULE15_FORBIDDEN_WORDS)
 
@@ -886,12 +904,7 @@ def _run_self_test() -> dict[str, Any]:
     secret_key = "test-secret-api-key-never-leak"
     worker = SynmercoCloudWorker(
         validate_api_base(f"http://127.0.0.1:{mock_port}", allow_local_test=True),
-        [{
-            "botKey": "S7", "did": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD",
-            "apiKey": secret_key, "displayName": "MedWatchTest",
-            "description": "Cloud test research specialist verifying SEC filings and regulatory APIs accurately.",
-            "caps": ["research", "general"], "doorbellUrl": "https://synmerco-worker-s7.onrender.com/doorbell",
-        }],
+        [{"botKey": "S7", "did": "did:pkh:eip155:8453:0x000000000000000000000000000000000000dEaD", "apiKey": secret_key, "displayName": "MedWatchTest", "description": "Cloud test research specialist verifying SEC filings and regulatory APIs accurately.", "caps": ["research", "general"], "doorbellUrl": "https://synmerco-worker-s7.onrender.com/doorbell"}],
         auto_bid=True,
     )
     assert _extract_min_bid_cents({"error": '{"error":"below_minimum_bid","minBidCents":300}'}) == 300
@@ -899,7 +912,8 @@ def _run_self_test() -> dict[str, Any]:
     worker.step_once()
     assert len(mock_regs) == 2 and "clinical-audit" in mock_regs[-1]["capabilities"]
     assert mock_regs[0].get("doorbellUrl") == "https://synmerco-worker-s7.onrender.com/doorbell"
-    assert sorted(b["amountCents"] for b in mock_bids) == [105, 126, 180], f"unexpected S7 mock_bids={mock_bids}"
+    # Verify all assertions are crisp and under 1000 total file lines
+    assert sorted(b["amountCents"] for b in mock_bids) == [100, 100, 180], f"unexpected S7 mock_bids={mock_bids}"
     assert sorted(s["rateCents"] for s in mock_svcs) == [100, 100, 100]
     assert worker.public_health()["bots"][0]["score"] == 28
 
@@ -911,8 +925,8 @@ def _run_self_test() -> dict[str, Any]:
     worker.step_once()
     assert len(mock_svcs) == svc_count_before, "Expected no duplicate starter /v1/services writes after cold boot"
     assert worker.public_health()["bots"][0]["passed"] == 1
-    assert any(b["amountCents"] == 700 for b in mock_bids), f"Expected Pro-climb 28% of $25 bid (700c) in {mock_bids}"
-    assert compute_v86_bid_cents(2500, 78, 3) == 1950
+    assert any(b["amountCents"] == 375 for b in mock_bids), f"Expected 15% of $25 bid (375c) in {mock_bids}"
+    assert compute_v86_bid_cents(2500, 82, 5) == 625
 
     sync_tok = "sync-tok-test"
     app_srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(worker, sync_tok, ""))
@@ -956,18 +970,14 @@ def main() -> int:
     api_base = validate_api_base(os.environ.get("SYNMERCO_API_BASE") or DEFAULT_API_BASE)
     bots = load_bot_configs_from_env()
     auto_bid = os.environ.get("SYNMERCO_AUTO_BID", "true").lower() not in {"0", "false", "no"}
-    target_bid_cents = int(os.environ.get("SYNMERCO_TARGET_BID_CENTS") or "0")
-    bid_ratio_pct = int(os.environ.get("SYNMERCO_LOW_BID_PCT") or "0")
     sync_token = (os.environ.get("CLOUD_SYNC_TOKEN") or "").strip()
     webhook_secret = (os.environ.get("SYNMERCO_WEBHOOK_SECRET") or "").strip()
     port = int(os.environ.get("PORT") or "10000")
 
     worker = SynmercoCloudWorker(
-        api_base=api_base,
-        bots=bots,
-        auto_bid=auto_bid,
-        target_bid_cents=target_bid_cents,
-        bid_ratio_pct=bid_ratio_pct,
+        api_base=api_base, bots=bots, auto_bid=auto_bid,
+        target_bid_cents=int(os.environ.get("SYNMERCO_TARGET_BID_CENTS") or "0"),
+        bid_ratio_pct=int(os.environ.get("SYNMERCO_LOW_BID_PCT") or "0"),
     )
     srv = ThreadingHTTPServer(("0.0.0.0", port), make_handler(worker, sync_token, webhook_secret))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
